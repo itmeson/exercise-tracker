@@ -1,0 +1,17 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.vscode/
+.idea/
+
+# Dependencies / build output (in case this grows later)
+node_modules/
+dist/
+build/
+.cache/
+
+# Local scratch
+_to_delete/
+*.local
