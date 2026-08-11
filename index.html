@@ -80,18 +80,39 @@ nav svg{width:21px;height:21px;stroke:currentColor;fill:none;stroke-width:1.8;
 .flag.bad.on{background:var(--bad);border-color:var(--bad);color:#1a0808;font-weight:650}
 
 /* calendar */
-.mon{margin-bottom:20px}
+.mon{margin-bottom:22px}
 .mon h3{font-size:14px;margin:0 0 8px;font-weight:640;letter-spacing:.4px}
-.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
-.dow{font-size:10.5px;color:var(--dim);text-align:center;padding-bottom:3px}
-.cell{aspect-ratio:1;border-radius:6px;background:#20262f;position:relative;
+.grid{display:grid;grid-template-columns:repeat(7,1fr);column-gap:4px;row-gap:0}
+.dow{font-size:10.5px;color:var(--dim);text-align:center;padding-bottom:4px}
+.cell{aspect-ratio:1;border-radius:7px;background:#20262f;position:relative;
   cursor:pointer;overflow:hidden;border:1px solid transparent}
 .cell.empty{background:none;cursor:default}
 .cell.today{border-color:var(--accent)}
-.cell .n{position:absolute;top:2px;left:4px;font-size:9.5px;color:#c9d4e2;
-  opacity:.75;z-index:2;text-shadow:0 1px 2px rgba(0,0,0,.6)}
-.cell .pain{position:absolute;bottom:0;left:0;right:0;height:4px;z-index:2}
-.cell .fill{position:absolute;inset:0}
+.cell .n{position:absolute;top:1px;left:4px;font-size:9.5px;color:#c9d4e2;
+  opacity:.72;z-index:2;font-variant-numeric:tabular-nums}
+/* six fixed slots, one per category, always in CATLIST order.
+   Position carries identity; colour reinforces it. That keeps the palette on the
+   *adjacent* CVD pairlist (which it passes) instead of all-pairs (which it fails). */
+.slots{position:absolute;left:0;right:0;top:12px;bottom:0;display:grid;
+  grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(2,1fr);
+  place-items:center;padding:0 2px 2px}
+.slot{width:34%;aspect-ratio:1;max-width:11px;border-radius:50%}
+.slot.off{width:3px;max-width:3px;background:#333c47}
+.cell.future{background:none;cursor:default}
+.cell.future .n{opacity:.3}
+/* pain strip: one bar per day, aligned to the same 7 columns as the cells above.
+   Height encodes the value, so it is never colour-alone. The hairline is a shared
+   baseline — heights are only comparable against one. */
+/* Bars HANG from a rule sitting directly beneath their own week, so each bar is
+   unambiguously attached to the cell above it rather than floating between rows. */
+.pstrip{height:26px;display:flex;align-items:flex-start;justify-content:center;
+  margin:3px 0 10px;cursor:pointer;border-top:1px solid var(--line)}
+.pstrip.empty{cursor:default}
+/* no baseline where there is no possibility of data yet */
+.pstrip.future{border-top-color:transparent}
+.pbar{width:48%;border-radius:0 0 4px 4px;min-height:3px}
+.pkey{display:flex;align-items:center;gap:6px}
+.pkey i{display:block;width:13px;height:9px;border-radius:2px}
 
 /* charts */
 .chart{width:100%;height:auto;display:block;overflow:visible}
@@ -231,7 +252,7 @@ const SEED = [
 ];
 
 /* ============================ state ============================ */
-let DB = null, TAB = "log", LOGDATE = todayStr(), MONTHS = 4;
+let DB = null, TAB = "log", LOGDATE = todayStr(), MONTHS = 2;
 
 function blank(){
   return {v:SCHEMA, exercises:SEED.map(s=>({name:s[0],cat:s[1],metrics:s[2]})),
@@ -912,17 +933,68 @@ function editTracker(id){
 }
 
 /* ============================ VIEW: CALENDAR ============================ */
+/* Which pain series the strip shows. Resolved once per render to whichever the
+   user actually has data for — old v1 history only has `pain`. */
+let PAINSER = null;
+function painSeriesOptions(){
+  return (DB.trackers||[]).filter(t=>t.type==="scale" && t.polarity==="badHigh" && !t.retired);
+}
+function resolvePainSeries(){
+  const opts=painSeriesOptions();
+  if(!opts.length){ PAINSER=null; return; }
+  if(PAINSER && opts.some(t=>t.id===PAINSER)) return;
+  const count=id=>Object.values(DB.sessions).filter(s=>s.metrics&&s.metrics[id]!=null).length;
+  /* prefer pain-on-waking once it has a real foothold — it is the outcome variable.
+     Fall back to whichever has most data, which is what v1-only history will hit. */
+  if(opts.some(t=>t.id==="painAM") && count("painAM")>=5){ PAINSER="painAM"; return; }
+  PAINSER = opts.slice().sort((a,b)=>count(b.id)-count(a.id))[0].id;
+}
+/* 5-step single-hue ordinal ramp, validated against the #20262f cell surface:
+   monotone lightness, adjacent ΔL >= 0.06, dim end 2.04:1, hue spread 0°. */
+const PAIN_RAMP = ["#83423e","#9f544f","#bc6761","#da7b74","#f98f87"];
+function painStep(v){ return PAIN_RAMP[Math.max(0,Math.min(4,Math.round(v/10*4)))]; }
+
 function viewCal(app){
   app.appendChild(h("<h1>Calendar</h1>"));
+  resolvePainSeries();
 
-  const leg=h('<div class="card" style="padding:11px"><div class="row wrap" style="gap:9px"></div></div>');
-  const lr=leg.firstElementChild;
-  CATLIST.forEach(c=>lr.appendChild(h('<span class="tiny" style="display:inline-flex;align-items:center;gap:5px">'+
-    '<span class="dot" style="background:'+CATHEX[c]+'"></span>'+c+'</span>')));
-  lr.appendChild(h('<span class="tiny" style="display:inline-flex;align-items:center;gap:5px;margin-left:auto">'+
-    '<span style="width:16px;height:5px;border-radius:2px;background:linear-gradient(90deg,'+painColor(0)+','+painColor(10)+')"></span>pain</span>'));
+  /* legend laid out in the same 3x2 arrangement as the slots inside a day,
+     so it doubles as a map of which position means what */
+  const leg=h('<div class="card" style="padding:12px"></div>');
+  const lg=h('<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:7px 10px"></div>');
+  CATLIST.forEach(c=>lg.appendChild(h('<span class="tiny" style="display:inline-flex;align-items:center;gap:6px">'+
+    '<span class="dot" style="width:10px;height:10px;background:'+CATHEX[c]+'"></span>'+c+'</span>')));
+  leg.appendChild(lg);
+  leg.appendChild(h('<div class="tiny" style="margin-top:9px;padding-top:9px;border-top:1px solid var(--line)">'+
+    'Each category always sits in the same spot, so the pattern of a day is recognisable at a glance. '+
+    'Count the bright dots for variety.</div>'));
   app.appendChild(leg);
-  app.appendChild(h('<div class="tiny" style="margin:-4px 2px 14px">Colour = category worked. Depth = how hard, relative to your own recent norm for those exercises. Tap a day for detail.</div>'));
+
+  /* pain strip controls + scale key */
+  const opts=painSeriesOptions();
+  if(opts.length){
+    const pc=h('<div class="card" style="padding:12px"></div>');
+    const hd=h('<div class="row" style="margin-bottom:9px"><h2 style="margin:0;flex:1">Pain strip</h2></div>');
+    const key=h('<div class="pkey"></div>');
+    PAIN_RAMP.forEach(c=>key.appendChild(h('<i style="background:'+c+'"></i>')));
+    key.appendChild(h('<span class="tiny">0 &rarr; 10</span>'));
+    hd.appendChild(key);
+    pc.appendChild(hd);
+    if(opts.length>1){
+      const sw=h('<div class="row wrap" style="gap:5px"></div>');
+      opts.forEach(t=>{
+        const n=Object.values(DB.sessions).filter(s=>s.metrics&&s.metrics[t.id]!=null).length;
+        const b=h('<button class="pill sm'+(t.id===PAINSER?" on":"")+'">'+esc(t.label)+
+          ' <span style="opacity:.6">'+n+'</span></button>');
+        b.onclick=()=>{ PAINSER=t.id; render(); };
+        sw.appendChild(b);
+      });
+      pc.appendChild(sw);
+    }
+    pc.appendChild(h('<div class="tiny" style="margin-top:9px">Bar height is the score, so it reads without relying on colour. '+
+      'Tap any day for the exact numbers.</div>'));
+    app.appendChild(pc);
+  }
 
   const now=new Date();
   for(let k=0;k<MONTHS;k++){
@@ -930,8 +1002,45 @@ function viewCal(app){
     app.appendChild(monthEl(d));
   }
   const more=h('<button class="ghost" style="width:100%;margin-bottom:16px">Show earlier months</button>');
-  more.onclick=()=>{MONTHS+=6;render();};
+  more.onclick=()=>{MONTHS+=4;render();};
   app.appendChild(more);
+}
+
+function dayCellEl(ds,tod){
+  const cats=dayCats(ds);
+  const future=parseYmd(ds)>parseYmd(tod);
+  const cell=h('<div class="cell'+(ds===tod?" today":"")+(future?" future":"")+
+    '"><span class="n">'+parseYmd(ds).getDate()+'</span></div>');
+  /* an untouched day stays visually blank — that is the "did I do anything" signal */
+  if(cats.length){
+    const sl=h('<div class="slots"></div>');
+    CATLIST.forEach(c=>{
+      const on=cats.includes(c);
+      sl.appendChild(h('<span class="slot'+(on?"":" off")+'"'+
+        (on?' style="background:'+CATHEX[c]+'"':'')+'></span>'));
+    });
+    cell.appendChild(sl);
+  }
+  if(future) return cell;
+  const t=trk(PAINSER);
+  const pv=PAINSER?trkVal(DB.sessions[ds],PAINSER):null;
+  cell.title=fmtDate(ds)+(cats.length? " — "+cats.join(", ") : " — nothing logged")+
+    (pv!=null && t? "\n"+t.label+": "+pv+"/10" : "");
+  cell.onclick=()=>daySheet(ds);
+  return cell;
+}
+function painCellEl(ds,tod){
+  const v=PAINSER?trkVal(DB.sessions[ds],PAINSER):null;
+  const st=h('<div class="pstrip"></div>');
+  if(parseYmd(ds)>parseYmd(tod)) st.classList.add("future");
+  if(v==null){ st.classList.add("empty"); return st; }
+  const pct=Math.round(2+(v/10)*98);
+  const bar=h('<div class="pbar" style="height:'+pct+'%;background:'+painStep(v)+'"></div>');
+  const t=trk(PAINSER);
+  st.title=fmtDate(ds)+" — "+(t?t.label:"pain")+": "+v+"/10";
+  st.appendChild(bar);
+  st.onclick=()=>daySheet(ds);
+  return st;
 }
 
 function monthEl(first){
@@ -939,32 +1048,22 @@ function monthEl(first){
   const wrap=h('<div class="mon"><h3>'+first.toLocaleDateString(undefined,{month:"long",year:"numeric"})+'</h3></div>');
   const g=h('<div class="grid"></div>');
   ["S","M","T","W","T","F","S"].forEach(d=>g.appendChild(h('<div class="dow">'+d+'</div>')));
-  const lead=new Date(y,m,1).getDay();
-  for(let i=0;i<lead;i++) g.appendChild(h('<div class="cell empty"></div>'));
-  const days=new Date(y,m+1,0).getDate();
+
   const tod=todayStr();
-  for(let dn=1;dn<=days;dn++){
-    const ds=ymd(new Date(y,m,dn));
-    const s=DB.sessions[ds];
-    const cell=h('<div class="cell'+(ds===tod?" today":"")+'"><span class="n">'+dn+'</span></div>');
-    const cats=dayCats(ds);
-    if(cats.length){
-      const a=.20+.80*dayIntensity(ds);
-      let bg;
-      if(cats.length===1) bg=rgba(CATHEX[cats[0]],a);
-      else{
-        const step=100/cats.length;
-        bg="linear-gradient(180deg,"+cats.map((c,i)=>
-          rgba(CATHEX[c],a)+" "+(i*step)+"%,"+rgba(CATHEX[c],a)+" "+((i+1)*step)+"%").join(",")+")";
-      }
-      cell.appendChild(h('<div class="fill" style="background:'+bg+'"></div>'));
-    }
-    const cp=painOf(s);
-    if(cp!=null)
-      cell.appendChild(h('<div class="pain" style="background:'+painColor(cp)+'"></div>'));
-    if(parseYmd(ds)>parseYmd(tod)) cell.style.opacity=".38";
-    cell.onclick=()=>daySheet(ds);
-    g.appendChild(cell);
+  const slots=[];
+  const lead=new Date(y,m,1).getDay();
+  for(let i=0;i<lead;i++) slots.push(null);
+  const days=new Date(y,m+1,0).getDate();
+  for(let dn=1;dn<=days;dn++) slots.push(ymd(new Date(y,m,dn)));
+  while(slots.length%7) slots.push(null);
+
+  /* a week of cells, then that same week's pain bars directly beneath —
+     same grid, so the columns line up and you can read straight down */
+  for(let w=0;w*7<slots.length;w++){
+    const week=slots.slice(w*7,w*7+7);
+    week.forEach(ds=>g.appendChild(ds?dayCellEl(ds,tod):h('<div class="cell empty"></div>')));
+    if(PAINSER)
+      week.forEach(ds=>g.appendChild(ds?painCellEl(ds,tod):h('<div class="pstrip empty future"></div>')));
   }
   wrap.appendChild(g);
   return wrap;
