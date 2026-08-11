@@ -7,6 +7,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#12161d">
 <title>Movement Log</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312161d'/%3E%3Cg stroke='%236ea8fe' stroke-width='3' stroke-linecap='round' fill='none'%3E%3Cpath d='M7 22V13M13 22V8M19 22v-6M25 22v-11'/%3E%3C/g%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#12161d; --panel:#1b212b; --panel2:#232b37; --line:#2f3846;
@@ -118,6 +119,28 @@ nav svg{width:21px;height:21px;stroke:currentColor;fill:none;stroke-width:1.8;
   border-bottom:1px solid var(--line);cursor:pointer}
 .exrow:last-child{border-bottom:0}
 .hide{display:none !important}
+
+/* trackers / daily check-in */
+.scale{display:flex;gap:3px}
+.scale .sc{flex:1;min-width:0;padding:6px 0;font-size:13px;min-height:34px;
+  border-radius:8px;text-align:center;font-variant-numeric:tabular-nums}
+.trk{padding:12px 0;border-bottom:1px solid var(--line)}
+.trk:last-child{border-bottom:0;padding-bottom:2px}
+.grp{display:flex;align-items:baseline;gap:8px;margin:14px 0 2px;
+  padding-top:11px;border-top:1px solid var(--line)}
+.grp>span:first-child{font-size:11.5px;font-weight:680;letter-spacing:.8px;
+  text-transform:uppercase;color:var(--accent);flex:1}
+.grp+.trk{padding-top:9px}
+.card>.grp:first-of-type{margin-top:8px;padding-top:0;border-top:0}
+.trk .lbl{display:flex;align-items:baseline;gap:7px;margin-bottom:7px}
+.trk .lbl b{font-size:14px;font-weight:600}
+.tog{display:flex;gap:6px}
+.tog button{flex:1}
+.numwrap{display:flex;align-items:center;gap:9px}
+.numwrap input{max-width:110px;text-align:center;font-variant-numeric:tabular-nums}
+.prompt{display:flex;align-items:center;gap:10px;background:var(--panel);
+  border:1px solid var(--accent);border-radius:12px;padding:11px 12px;margin-bottom:12px}
+.entry .enote{width:100%;min-height:0;height:36px;margin-top:8px;font-size:13.5px;padding:8px 9px}
 </style>
 </head>
 <body>
@@ -146,6 +169,34 @@ const METRICS = {
   rpe   : {label:"Effort",   unit:"/10",  step:1,   dec:0}
 };
 const SYMPTOM_CHIPS = ["fragile","sore","stiff","tight","achy","spasm","tingling","loose","strong","good day"];
+
+/* ---- daily trackers ----
+   Per-day context/outcome variables. Deliberately NOT exercises: they must stay
+   out of streaks, day load and calendar categories.
+   type: scale (0-10) | number | bool | choice
+   polarity: badHigh (high = worse, red) | goodHigh (high = better) | neutral
+   when: am | pm
+
+   Everything is recorded against the day it actually happened. Nothing is
+   entered retrospectively — the analysis does the time-shifting, so the same
+   data can be tested at a one-day lag, a two-day lag, or as a rolling load.
+   `when` only says which half of the day you can honestly answer it in.        */
+const SCHEMA = 3;
+const WHENS = {am:"Morning", pm:"End of day"};
+const DEFAULT_TRACKERS = [
+  {id:"painAM",  label:"Pain on waking", type:"scale",  polarity:"badHigh",  pinned:true,
+   when:"am", hint:"First thing, before you move around much. The one field you cannot fill in later."},
+  {id:"sleepHrs",label:"Sleep last night", type:"number", unit:"hr", step:.25, max:16,
+   when:"am", hint:"The night that just ended"},
+  {id:"sleepQ",  label:"Sleep quality",  type:"scale",  polarity:"goodHigh",
+   when:"am", lo:"awful", hi:"great", hint:"Last night, not how rested you feel now"},
+  {id:"pain",    label:"Pain right now", type:"scale",  polarity:"badHigh",  pinned:true,
+   when:"pm"},
+  {id:"sitting", label:"Hours sitting",  type:"number", unit:"hr", step:.5,  max:24,
+   when:"pm", hint:"Today — desk, couch and car combined"},
+  {id:"twisted", label:"Twisted or lifted awkwardly", type:"bool",
+   when:"pm", hint:"Today, even if it felt fine at the time"}
+];
 
 const SEED = [
   ["Exercise Bike","Cardio",["time","rpe"]],
@@ -183,7 +234,8 @@ const SEED = [
 let DB = null, TAB = "log", LOGDATE = todayStr(), MONTHS = 4;
 
 function blank(){
-  return {v:1, exercises:SEED.map(s=>({name:s[0],cat:s[1],metrics:s[2]})), sessions:{}};
+  return {v:SCHEMA, exercises:SEED.map(s=>({name:s[0],cat:s[1],metrics:s[2]})),
+          trackers:DEFAULT_TRACKERS.map(t=>Object.assign({},t)), sessions:{}};
 }
 function load(){
   try{
@@ -192,8 +244,54 @@ function load(){
   }catch(e){ DB = blank(); }
   if(!DB.exercises || !DB.exercises.length) DB.exercises = blank().exercises;
   if(!DB.sessions) DB.sessions = {};
+  const was = DB.v || 1;
+  migrate(DB);
+  /* persist the upgrade straight away, so the stored copy and any export made
+     before the next edit are already in the new shape */
+  if(was < SCHEMA) save();
+}
+
+/* ---- schema migration ----
+   Runs on load and on every imported payload, so old exports keep working. */
+function migrate(db){
+  if(!Array.isArray(db.trackers) || !db.trackers.length)
+    db.trackers = DEFAULT_TRACKERS.map(t=>Object.assign({},t));
+
+  /* v2 -> v3: trackers gained `when`, and sleep gained an explicit night */
+  db.trackers.forEach(t=>{
+    if(!t.when){
+      const d=DEFAULT_TRACKERS.find(x=>x.id===t.id);
+      t.when = (d && d.when) ? d.when : "pm";
+    }
+    /* only rename if it is still the old default label, never a user's own */
+    if(t.id==="sleepHrs" && t.label==="Sleep") t.label="Sleep last night";
+    if(!t.hint){
+      const d=DEFAULT_TRACKERS.find(x=>x.id===t.id);
+      if(d && d.hint) t.hint=d.hint;
+    }
+  });
+  /* keep morning fields ahead of evening ones without disturbing order within a group */
+  db.trackers = [...db.trackers.filter(t=>t.when==="am"), ...db.trackers.filter(t=>t.when!=="am")];
+
+  for(const d in db.sessions) migrateSession(db.sessions[d]);
+  db.v = SCHEMA;
+  return db;
+}
+function migrateSession(s){
+  if(!s || typeof s!=="object") return s;
+  if(!s.metrics || typeof s.metrics!=="object") s.metrics = {};
+  /* v1 stored a single untimed daily pain at session.pain */
+  if(s.pain!=null && s.metrics.pain==null) s.metrics.pain = s.pain;
+  (s.entries||[]).forEach(en=>{ if(en && en.note==null) en.note=""; });
+  return s;
 }
 function save(){
+  /* Mirror pain back to the v1 field. Transitional: if an older cached copy of
+     this page is still open on another device, it can still read the pain. */
+  for(const d in DB.sessions){
+    const s=DB.sessions[d];
+    if(s.metrics && s.metrics.pain!=null) s.pain=s.metrics.pain; else delete s.pain;
+  }
   try{ localStorage.setItem(KEY, JSON.stringify(DB)); }
   catch(e){ alert("Could not save — browser storage may be full or blocked."); }
 }
@@ -218,9 +316,28 @@ function getEx(name){
          {name:name,cat:"Mobility",metrics:["reps"]};
 }
 function sess(date,create){
-  if(!DB.sessions[date] && create) DB.sessions[date]={date:date,entries:[],pain:null,note:"",updated:Date.now()};
-  return DB.sessions[date] || null;
+  if(!DB.sessions[date] && create)
+    DB.sessions[date]={date:date,entries:[],metrics:{},note:"",updated:Date.now()};
+  const s=DB.sessions[date];
+  if(s && !s.metrics) s.metrics={};
+  return s || null;
 }
+/* ---- tracker access ---- */
+function trk(id){ return (DB.trackers||[]).find(t=>t.id===id) || null; }
+function trkVal(s,id){ return s && s.metrics ? (s.metrics[id]==null?null:s.metrics[id]) : null; }
+function setTrk(date,id,v){
+  const s=sess(date,true);
+  if(v==null || v==="") delete s.metrics[id]; else s.metrics[id]=v;
+  touch(date);
+}
+/* overall pain for a day — prefers the v2 field, falls back to v1 */
+function painOf(s){
+  if(!s) return null;
+  if(s.metrics && s.metrics.pain!=null) return s.metrics.pain;
+  return s.pain==null ? null : s.pain;
+}
+/* the "how wrecked am I today" outcome variable, for future lag analysis */
+function painAMOf(s){ return s && s.metrics && s.metrics.painAM!=null ? s.metrics.painAM : null; }
 function touch(date){ if(DB.sessions[date]) DB.sessions[date].updated=Date.now(); save(); }
 function datesWithWork(){
   return Object.keys(DB.sessions).filter(d=>(DB.sessions[d].entries||[]).length).sort();
@@ -333,7 +450,7 @@ document.querySelectorAll("nav button").forEach(b=>{
 
 /* ============================ VIEW: LOG ============================ */
 function viewLog(app){
-  const s = sess(LOGDATE,false) || {entries:[],pain:null,note:""};
+  const s = sess(LOGDATE,false) || {entries:[],metrics:{},note:""};
 
   const hd = h('<div class="row" style="margin:4px 0 14px">'+
     '<button class="sm ghost" id="pd">&#8249;</button>'+
@@ -351,6 +468,10 @@ function viewLog(app){
     '<div class="stat"><b>'+(s.entries||[]).length+'</b><span>today</span></div></div>');
   app.appendChild(st);
 
+  /* nudge for the morning reading */
+  const mp=morningPrompt(s);
+  if(mp) app.appendChild(mp);
+
   /* add box */
   app.appendChild(addBox());
 
@@ -364,8 +485,11 @@ function viewLog(app){
   }
   app.appendChild(list);
 
-  /* symptoms */
-  app.appendChild(symptomCard(s));
+  /* daily check-in + free text */
+  const ci=checkinCard(s);
+  ci.id="checkin";
+  app.appendChild(ci);
+  app.appendChild(noteCard(s));
 }
 
 function weekCount(){
@@ -449,7 +573,10 @@ function addEntry(name){
     if(prev && prev.sets && prev.sets.length){ sets=JSON.parse(JSON.stringify(prev.sets)); break; }
   }
   if(!sets) sets=[blankSet(ex)];
-  s.entries.push({exercise:name,sets:sets,flag:null,note:""});
+  /* newest first, so a freshly added exercise is visible without scrolling.
+     ts records when it was entered, so ordering no longer lives only in
+     array position. */
+  s.entries.unshift({exercise:name,sets:sets,flag:null,note:"",ts:Date.now()});
   touch(LOGDATE); render();
 }
 function blankSet(ex){
@@ -503,21 +630,114 @@ function entryCard(en,i){
   ft.querySelector(".flag.good").onclick=()=>{en.flag=en.flag==="good"?null:"good";touch(LOGDATE);render();};
   ft.querySelector(".flag.bad").onclick=()=>{en.flag=en.flag==="bad"?null:"bad";touch(LOGDATE);render();};
   card.appendChild(ft);
+
+  /* per-entry note — was in the schema but never surfaced */
+  const en_ta=h('<textarea class="enote" placeholder="Note for this exercise&hellip;">'+esc(en.note||"")+'</textarea>');
+  if(!(en.note||"").trim()) en_ta.style.opacity=".62";
+  en_ta.onfocus=()=>{ en_ta.style.opacity="1"; en_ta.style.height="64px"; };
+  en_ta.onblur=()=>{ if(!(en.note||"").trim()){ en_ta.style.opacity=".62"; en_ta.style.height="36px"; } };
+  en_ta.oninput=()=>{ en.note=en_ta.value; touch(LOGDATE); };
+  card.appendChild(en_ta);
   return card;
 }
 
-function symptomCard(s){
-  const card=h('<div class="card"><h2 style="margin-top:0">How does the back feel?</h2></div>');
-  const pr=h('<div class="row wrap" style="gap:5px;margin-bottom:11px"></div>');
+/* ---------- generic tracker controls ---------- */
+function scaleColor(v,pol){
+  if(v==null) return null;
+  if(pol==="goodHigh") return painColor(10-v);
+  if(pol==="neutral")  return "var(--accent)";
+  return painColor(v);
+}
+function scaleRow(val,pol,onPick){
+  const row=h('<div class="scale"></div>');
   for(let i=0;i<=10;i++){
-    const b=h('<button class="pill sm'+(s.pain===i?" on":"")+'" style="min-width:38px;padding:6px 0;flex:1;text-align:center">'+i+'</button>');
-    if(s.pain===i){ b.style.background=painColor(i); b.style.borderColor=painColor(i); b.style.color="#0b0606"; }
-    b.onclick=()=>{ const t=sess(LOGDATE,true); t.pain = (t.pain===i?null:i); touch(LOGDATE); render(); };
-    pr.appendChild(b);
+    const b=h('<button class="sc'+(val===i?" on":"")+'">'+i+'</button>');
+    if(val===i){
+      const c=scaleColor(i,pol);
+      b.style.background=c; b.style.borderColor=c;
+      b.style.color = pol==="neutral" ? "#0b1017" : "#0b0606";
+      b.style.fontWeight="680";
+    }
+    b.onclick=()=>onPick(val===i?null:i);
+    row.appendChild(b);
   }
-  card.appendChild(h('<div class="tiny" style="display:flex;justify-content:space-between;margin-bottom:5px"><span>0 &middot; none</span><span>10 &middot; worst</span></div>'));
-  card.appendChild(pr);
+  return row;
+}
+function trackerField(t,s){
+  const wrap=h('<div class="trk"></div>');
+  const lbl=h('<div class="lbl"><b>'+esc(t.label)+'</b></div>');
+  /* number fields already show the unit beside the input */
+  if(t.unit && t.type!=="number") lbl.appendChild(h('<span class="tiny">'+esc(t.unit)+'</span>'));
+  wrap.appendChild(lbl);
+  if(t.hint) wrap.appendChild(h('<div class="tiny" style="margin:-3px 0 8px">'+esc(t.hint)+'</div>'));
+  const v=trkVal(s,t.id);
 
+  if(t.type==="scale"){
+    const lo=t.lo||(t.polarity==="goodHigh"?"awful":"none");
+    const hi=t.hi||(t.polarity==="goodHigh"?"great":"worst");
+    wrap.appendChild(h('<div class="tiny" style="display:flex;justify-content:space-between;margin-bottom:5px">'+
+      '<span>0 &middot; '+esc(lo)+'</span><span>10 &middot; '+esc(hi)+'</span></div>'));
+    wrap.appendChild(scaleRow(v,t.polarity,nv=>{ setTrk(LOGDATE,t.id,nv); render(); }));
+
+  } else if(t.type==="number"){
+    const nw=h('<div class="numwrap"></div>');
+    const inp=h('<input type="number" inputmode="decimal" step="'+(t.step||1)+'"'+
+      (t.max!=null?' max="'+t.max+'"':'')+' min="0" value="'+esc(v==null?"":v)+'">');
+    inp.oninput=()=>setTrk(LOGDATE,t.id,inp.value===""?null:+inp.value);
+    nw.appendChild(inp);
+    if(t.unit) nw.appendChild(h('<span class="muted">'+esc(t.unit)+'</span>'));
+    wrap.appendChild(nw);
+
+  } else if(t.type==="bool"){
+    const tg=h('<div class="tog"></div>');
+    [["No",false],["Yes",true]].forEach(([lab,bv])=>{
+      const on = v===bv;
+      const b=h('<button class="pill sm'+(on?" on":"")+'">'+lab+'</button>');
+      if(on && bv){ b.style.background="var(--bad)"; b.style.borderColor="var(--bad)"; b.style.color="#1a0808"; }
+      b.onclick=()=>{ setTrk(LOGDATE,t.id, v===bv?null:bv); render(); };
+      tg.appendChild(b);
+    });
+    wrap.appendChild(tg);
+
+  } else if(t.type==="choice"){
+    const cr=h('<div class="row wrap" style="gap:5px"></div>');
+    (t.options||[]).forEach(o=>{
+      const b=h('<button class="pill sm'+(v===o?" on":"")+'">'+esc(o)+'</button>');
+      b.onclick=()=>{ setTrk(LOGDATE,t.id, v===o?null:o); render(); };
+      cr.appendChild(b);
+    });
+    wrap.appendChild(cr);
+  }
+  return wrap;
+}
+
+function checkinCard(s){
+  const card=h('<div class="card"><div class="row" style="margin-bottom:4px">'+
+    '<h2 style="margin:0;flex:1">Daily check-in</h2></div></div>');
+  const cfg=h('<button class="sm ghost" title="Manage trackers">Manage</button>');
+  cfg.onclick=()=>trackerList();
+  card.firstElementChild.appendChild(cfg);
+  const active=(DB.trackers||[]).filter(t=>!t.retired);
+  if(!active.length){
+    card.appendChild(h('<div class="muted" style="padding:10px 0">No trackers yet. Tap Manage to add one.</div>'));
+    return card;
+  }
+  /* grouped by when you can honestly answer it, not by what it measures */
+  Object.keys(WHENS).forEach(w=>{
+    const grp=active.filter(t=>(t.when||"pm")===w);
+    if(!grp.length) return;
+    const done=grp.filter(t=>trkVal(s,t.id)!=null).length;
+    card.appendChild(h('<div class="grp"><span>'+esc(WHENS[w])+'</span>'+
+      '<span class="tiny">'+done+' of '+grp.length+'</span></div>'));
+    grp.forEach(t=>card.appendChild(trackerField(t,s)));
+  });
+  return card;
+}
+
+function noteCard(s){
+  const card=h('<div class="card"><h2 style="margin-top:0">Anything else about today?</h2>'+
+    '<div class="tiny" style="margin:-4px 0 9px">Free text is for things you have not learned to measure yet. '+
+    'If a word keeps coming back, make it a tracker.</div></div>');
   const ta=h('<textarea placeholder="Words for it &mdash; fragile, sore, stiff, loose&hellip;">'+esc(s.note||"")+'</textarea>');
   ta.oninput=()=>{ const t=sess(LOGDATE,true); t.note=ta.value; touch(LOGDATE); };
   card.appendChild(ta);
@@ -536,6 +756,159 @@ function symptomCard(s){
   });
   card.appendChild(ch);
   return card;
+}
+
+/* prompt at the top of today when the morning reading is still missing */
+function morningPrompt(s){
+  const t=trk("painAM");
+  if(!t || t.retired || LOGDATE!==todayStr() || trkVal(s,"painAM")!=null) return null;
+  const p=h('<div class="prompt"><div class="grow"><b style="font-size:14px">'+esc(t.label)+'</b>'+
+    '<div class="tiny">Not recorded yet &mdash; everything else gets compared against this, '+
+    'and it is the one field you cannot reconstruct tonight.</div></div></div>');
+  const go=h('<button class="pill sm" style="flex:none">Add</button>');
+  go.onclick=()=>{
+    const el=document.getElementById("checkin");
+    if(el){ el.scrollIntoView({behavior:"smooth",block:"center"}); }
+  };
+  p.appendChild(go);
+  return p;
+}
+
+/* ---------- tracker management ---------- */
+function trackerList(){
+  sheet((box,close)=>{
+    box.appendChild(h('<h3>Trackers</h3>'+
+      '<div class="tiny" style="margin-bottom:14px">Things recorded once a day. Kept separate from exercises '+
+      'so they never count towards streaks or training load.</div>'));
+    const lst=h('<div class="card" style="padding:4px 12px"></div>');
+    (DB.trackers||[]).forEach(t=>{
+      const r=h('<div class="exrow"><span class="grow">'+
+        '<span style="font-weight:560'+(t.retired?';opacity:.5':'')+'">'+esc(t.label)+'</span><br>'+
+        '<span class="tiny">'+esc(WHENS[t.when||"pm"])+' &middot; '+esc(TYPE_LABEL[t.type]||t.type)+
+        (t.unit?" &middot; "+esc(t.unit):"")+
+        (t.pinned?" &middot; built in":"")+(t.retired?" &middot; retired":"")+'</span></span>'+
+        '<span class="tiny" style="opacity:.6">&rsaquo;</span></div>');
+      r.onclick=()=>{ close(); editTracker(t.id); };
+      lst.appendChild(r);
+    });
+    box.appendChild(lst);
+    const nb=h('<button class="ghost" style="width:100%">+ New tracker</button>');
+    nb.onclick=()=>{ close(); editTracker(null); };
+    box.appendChild(nb);
+  });
+}
+const TYPE_LABEL={scale:"0-10 scale",number:"Number",bool:"Yes / no",choice:"Pick one"};
+
+function editTracker(id){
+  sheet((box,close)=>{
+    const cur = id ? (DB.trackers||[]).find(t=>t.id===id) : null;
+    box.appendChild(h('<h3>'+(cur?"Edit tracker":"New tracker")+'</h3>'+
+      '<div class="tiny" style="margin-bottom:14px">Keep the list short. Every extra field is one you will skip on a bad day.</div>'));
+
+    const nf=h('<div style="margin-bottom:12px"><label>Label</label><input value="'+
+      esc(cur?cur.label:"")+'" placeholder="Hours driving"></div>');
+    box.appendChild(nf);
+    const nameInp=nf.querySelector("input");
+
+    let type = cur?cur.type:"scale";
+    box.appendChild(h('<label>Type</label>'));
+    const tr=h('<div class="row wrap" style="gap:5px;margin-bottom:14px"></div>');
+    Object.keys(TYPE_LABEL).forEach(k=>{
+      const b=h('<button class="pill sm'+(k===type?" on":"")+'">'+TYPE_LABEL[k]+'</button>');
+      b.onclick=()=>{ type=k; tr.querySelectorAll("button").forEach(x=>x.classList.remove("on"));
+        b.classList.add("on"); paintExtra(); };
+      tr.appendChild(b);
+    });
+    box.appendChild(tr);
+
+    let when = cur?(cur.when||"pm"):"pm";
+    box.appendChild(h('<label>When can you answer it?</label>'));
+    const wr=h('<div class="row wrap" style="gap:5px;margin-bottom:4px"></div>');
+    Object.keys(WHENS).forEach(k=>{
+      const b=h('<button class="pill sm'+(k===when?" on":"")+'">'+WHENS[k]+'</button>');
+      b.onclick=()=>{ when=k; wr.querySelectorAll("button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); };
+      wr.appendChild(b);
+    });
+    box.appendChild(wr);
+    box.appendChild(h('<div class="tiny" style="margin-bottom:14px">Only affects where it sits in the check-in. '+
+      'The value is always recorded against the day on screen.</div>'));
+
+    const extra=h('<div></div>');
+    box.appendChild(extra);
+    let unit = cur?(cur.unit||""):"";
+    let pol  = cur?(cur.polarity||"badHigh"):"badHigh";
+    let opts = cur?((cur.options||[]).join(", ")):"";
+    function paintExtra(){
+      extra.innerHTML="";
+      if(type==="number"){
+        const uf=h('<div style="margin-bottom:14px"><label>Unit</label><input value="'+esc(unit)+'" placeholder="hr"></div>');
+        uf.querySelector("input").oninput=e=>unit=e.target.value;
+        extra.appendChild(uf);
+      }
+      if(type==="scale"){
+        extra.appendChild(h('<label>Which direction is bad?</label>'));
+        const pr=h('<div class="row wrap" style="gap:5px;margin-bottom:14px"></div>');
+        [["badHigh","10 is worse"],["goodHigh","10 is better"],["neutral","Neither"]].forEach(([k,lab])=>{
+          const b=h('<button class="pill sm'+(k===pol?" on":"")+'">'+lab+'</button>');
+          b.onclick=()=>{ pol=k; pr.querySelectorAll("button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); };
+          pr.appendChild(b);
+        });
+        extra.appendChild(pr);
+      }
+      if(type==="choice"){
+        const of=h('<div style="margin-bottom:14px"><label>Options, comma separated</label>'+
+          '<input value="'+esc(opts)+'" placeholder="side, back, stomach"></div>');
+        of.querySelector("input").oninput=e=>opts=e.target.value;
+        extra.appendChild(of);
+      }
+    }
+    paintExtra();
+
+    const sv=h('<button class="primary" style="width:100%;margin-bottom:8px">'+(cur?"Save":"Create")+'</button>');
+    sv.onclick=()=>{
+      const lab=nameInp.value.trim();
+      if(!lab){ alert("Give it a label."); return; }
+      const o = type==="choice"
+        ? opts.split(",").map(x=>x.trim()).filter(Boolean) : null;
+      if(type==="choice" && (!o||o.length<2)){ alert("Give it at least two options."); return; }
+      if(cur){
+        cur.label=lab; cur.type=type; cur.when=when;
+        cur.unit = type==="number"? (unit.trim()||"") : "";
+        if(type==="scale") cur.polarity=pol; else delete cur.polarity;
+        if(o) cur.options=o; else delete cur.options;
+      } else {
+        const base=lab.toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_|_$/g,"")||"trk";
+        let nid=base, k=2;
+        while((DB.trackers||[]).some(t=>t.id===nid)) nid=base+"_"+(k++);
+        DB.trackers.push(Object.assign({id:nid,label:lab,type:type,when:when},
+          type==="number"?{unit:unit.trim()||"",step:.5}:{},
+          type==="scale"?{polarity:pol}:{},
+          o?{options:o}:{}));
+      }
+      save(); close(); render();
+    };
+    box.appendChild(sv);
+
+    if(cur){
+      const isRet=!!cur.retired;
+      const rb=h('<button style="width:100%;margin-bottom:8px">'+(isRet?"Un-retire":"Retire (keeps history)")+'</button>');
+      rb.onclick=()=>{ cur.retired=!isRet; save(); close(); render(); };
+      box.appendChild(rb);
+
+      if(!cur.pinned){
+        const del=h('<button style="width:100%;border-color:var(--bad);color:var(--bad)">Delete and erase its data</button>');
+        del.onclick=()=>{
+          const used=Object.values(DB.sessions).filter(s=>s.metrics&&s.metrics[cur.id]!=null).length;
+          if(used && !confirm("This will erase "+used+" recorded value"+(used===1?"":"s")+
+            ". Retiring keeps the history instead. Delete anyway?")) return;
+          DB.trackers=DB.trackers.filter(t=>t!==cur);
+          for(const d in DB.sessions) if(DB.sessions[d].metrics) delete DB.sessions[d].metrics[cur.id];
+          save(); close(); render();
+        };
+        box.appendChild(del);
+      }
+    }
+  });
 }
 
 /* ============================ VIEW: CALENDAR ============================ */
@@ -586,8 +959,9 @@ function monthEl(first){
       }
       cell.appendChild(h('<div class="fill" style="background:'+bg+'"></div>'));
     }
-    if(s && s.pain!=null)
-      cell.appendChild(h('<div class="pain" style="background:'+painColor(s.pain)+'"></div>'));
+    const cp=painOf(s);
+    if(cp!=null)
+      cell.appendChild(h('<div class="pain" style="background:'+painColor(cp)+'"></div>'));
     if(parseYmd(ds)>parseYmd(tod)) cell.style.opacity=".38";
     cell.onclick=()=>daySheet(ds);
     g.appendChild(cell);
@@ -713,6 +1087,8 @@ function doImport(txt){
   let inc;
   try{ inc=JSON.parse(txt); }catch(e){ alert("That doesn't look like valid backup data."); return; }
   if(!inc || typeof inc!=="object" || !inc.sessions){ alert("That file is missing session data."); return; }
+  /* bring an older payload up to the current schema before merging */
+  for(const d in inc.sessions) migrateSession(inc.sessions[d]);
   let added=0, updated=0;
   for(const d in inc.sessions){
     const a=inc.sessions[d], b=DB.sessions[d];
@@ -723,8 +1099,15 @@ function doImport(txt){
   (inc.exercises||[]).forEach(e=>{
     if(!DB.exercises.some(x=>x.name.toLowerCase()===e.name.toLowerCase())){ DB.exercises.push(e); newEx++; }
   });
+  /* trackers the other device defined but this one has never seen */
+  let newTrk=0;
+  (inc.trackers||[]).forEach(t=>{
+    if(!(DB.trackers||[]).some(x=>x.id===t.id)){ DB.trackers.push(t); newTrk++; }
+  });
   save(); render();
-  alert("Merged: "+added+" new day"+(added===1?"":"s")+", "+updated+" updated, "+newEx+" new exercise"+(newEx===1?"":"s")+".");
+  alert("Merged: "+added+" new day"+(added===1?"":"s")+", "+updated+" updated, "+
+    newEx+" new exercise"+(newEx===1?"":"s")+
+    (newTrk?", "+newTrk+" new tracker"+(newTrk===1?"":"s"):"")+".");
 }
 
 /* ============================ sheets ============================ */
@@ -759,12 +1142,20 @@ function daySheet(date){
         box.appendChild(card);
       });
     }
-    if(s && (s.pain!=null || s.note)){
+    const recorded=(DB.trackers||[]).filter(t=>s&&s.metrics&&s.metrics[t.id]!=null);
+    if(recorded.length || (s&&s.note)){
       const p=h('<div class="card" style="margin-top:6px"></div>');
-      if(s.pain!=null) p.appendChild(h('<div class="row" style="gap:8px;align-items:center">'+
-        '<span class="dot" style="width:12px;height:12px;background:'+painColor(s.pain)+'"></span>'+
-        '<b>Pain '+s.pain+'/10</b></div>'));
-      if(s.note) p.appendChild(h('<div class="muted" style="margin-top:'+(s.pain!=null?"7px":"0")+'">'+esc(s.note)+'</div>'));
+      recorded.forEach((t,i)=>{
+        const v=s.metrics[t.id];
+        const row=h('<div class="row" style="gap:8px;align-items:center'+(i?";margin-top:7px":"")+'"></div>');
+        if(t.type==="scale") row.appendChild(h('<span class="dot" style="width:12px;height:12px;background:'+
+          scaleColor(v,t.polarity)+'"></span>'));
+        row.appendChild(h('<span class="grow muted">'+esc(t.label)+'</span>'));
+        row.appendChild(h('<b>'+esc(t.type==="bool"?(v?"yes":"no"):
+          (t.type==="scale"? v+"/10" : num(v,1)+(t.unit?" "+t.unit:"")))+'</b>'));
+        p.appendChild(row);
+      });
+      if(s&&s.note) p.appendChild(h('<div class="muted" style="margin-top:'+(recorded.length?"9px":"0")+'">'+esc(s.note)+'</div>'));
       box.appendChild(p);
     }
     const go=h('<button class="primary" style="width:100%;margin-top:6px">Edit this day</button>');
@@ -810,13 +1201,18 @@ function exSheet(name){
     const hist=[];
     Object.keys(DB.sessions).sort().forEach(d=>{
       const en=(DB.sessions[d].entries||[]).find(e=>e.exercise===name);
-      if(en) hist.push({d:d,en:en,pain:DB.sessions[d].pain});
+      if(en) hist.push({d:d,en:en,pain:painOf(DB.sessions[d])});
     });
+    /* Always offer to log it — not just when there's no history. */
+    const already=((sess(LOGDATE,false)||{entries:[]}).entries||[])
+      .some(e=>e.exercise===name);
+    const add=h('<button class="primary" style="width:100%;margin-bottom:14px">'+
+      (already?"Add again to ":"Add to ")+esc(fmtDate(LOGDATE)).toLowerCase()+'</button>');
+    add.onclick=()=>{ close(); TAB="log"; addEntry(name); };
+    box.appendChild(add);
+
     if(!hist.length){
-      box.appendChild(h('<div class="muted" style="padding:12px 0">No history yet. Log it once and a chart appears here.</div>'));
-      const add=h('<button class="primary" style="width:100%">Add to '+esc(fmtDate(LOGDATE)).toLowerCase()+'</button>');
-      add.onclick=()=>{ close(); TAB="log"; addEntry(name); };
-      box.appendChild(add);
+      box.appendChild(h('<div class="muted" style="padding:2px 0 12px">No history yet. Log it once and a chart appears here.</div>'));
       return;
     }
 
